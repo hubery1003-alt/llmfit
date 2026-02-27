@@ -225,6 +225,14 @@ impl SystemSpecs {
             });
         }
 
+        // WSL fallback: if /dev/dxg exists but vendor-specific probes found
+        // nothing, expose a synthetic GPU so fit logic can use a GPU path.
+        if gpus.is_empty()
+            && let Some(wsl_gpu) = Self::detect_wsl_dxg_gpu(total_ram_gb, cpu_name)
+        {
+            gpus.push(wsl_gpu);
+        }
+
         // Sort by VRAM descending so the best GPU is primary
         gpus.sort_by(|a, b| {
             let va = a.vram_gb.unwrap_or(0.0);
@@ -233,6 +241,28 @@ impl SystemSpecs {
         });
 
         gpus
+    }
+
+    /// Detect a GPU in WSL2 via the DXG bridge device.
+    /// This is a fallback for environments where nvidia-smi/rocm-smi/sysfs
+    /// are unavailable but /dev/dxg is present.
+    fn detect_wsl_dxg_gpu(total_ram_gb: f64, cpu_name: &str) -> Option<GpuInfo> {
+        if !cfg!(target_os = "linux") || !is_running_in_wsl() {
+            return None;
+        }
+        if !std::path::Path::new("/dev/dxg").exists() {
+            return None;
+        }
+
+        Some(GpuInfo {
+            name: "WSL GPU (/dev/dxg)".to_string(),
+            // WSL iGPU/dGPU memory reporting is inconsistent from Linux userland.
+            // Use total RAM as a practical unified-memory fallback.
+            vram_gb: Some(total_ram_gb),
+            backend: infer_wsl_dxg_backend(cpu_name),
+            count: 1,
+            unified_memory: true,
+        })
     }
 
     /// Detect NVIDIA GPUs via nvidia-smi. Returns one GpuInfo per unique model,
@@ -1223,6 +1253,19 @@ fn detect_running_in_wsl() -> bool {
         })
 }
 
+fn infer_wsl_dxg_backend(cpu_name: &str) -> GpuBackend {
+    let lower = cpu_name.to_lowercase();
+    if lower.contains("intel") {
+        GpuBackend::Sycl
+    } else if lower.contains("amd") || lower.contains("ryzen") {
+        GpuBackend::Vulkan
+    } else if lower.contains("nvidia") || lower.contains("geforce") {
+        GpuBackend::Cuda
+    } else {
+        GpuBackend::Vulkan
+    }
+}
+
 /// Check if the CPU name indicates an AMD APU with unified memory architecture.
 /// These APUs share the full system RAM between CPU and GPU (like Apple Silicon).
 /// Currently covers:
@@ -1468,7 +1511,7 @@ fn estimate_vram_from_name(name: &str) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::SystemSpecs;
+    use super::{GpuBackend, SystemSpecs};
 
     #[test]
     fn test_parse_nvidia_smi_does_not_sum_multi_gpu_vram() {
@@ -1553,5 +1596,17 @@ mod tests {
         assert_eq!(gpus.len(), 1);
         assert_eq!(gpus[0].count, 2);
         assert!(!gpus[0].unified_memory);
+    }
+
+    #[test]
+    fn test_infer_wsl_dxg_backend_from_cpu() {
+        assert_eq!(
+            super::infer_wsl_dxg_backend("Intel(R) Core(TM) Ultra 9 185H"),
+            GpuBackend::Sycl
+        );
+        assert_eq!(
+            super::infer_wsl_dxg_backend("AMD Ryzen AI 9 HX 370"),
+            GpuBackend::Vulkan
+        );
     }
 }
